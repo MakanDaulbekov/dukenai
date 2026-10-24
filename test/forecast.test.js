@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseCSV, generateDemo, toCSV, forecastProduct, buildPlan, addDays, todayKZ, category } from '../forecast.js';
+import { parseCSV, decodeCSV, generateDemo, toCSV, forecastProduct, buildPlan, addDays, todayKZ, category } from '../forecast.js';
 import { createApp } from '../server.js';
 const today = todayKZ(), tomorrow = addDays(today, 1);
 const row = (date, qty, extra={}) => ({ date, product:'Хлеб', qty, price:100, stock:3, shelf_life_days:2, ...extra });
@@ -78,3 +78,52 @@ test('English demo product names preserve forecasting categories',()=>{
   const p=buildPlan(generateDemo(),{date:tomorrow,today});
   assert.doesNotMatch(JSON.stringify(p),/[А-Яа-яЁё]/);
 });
+
+test('later forecast date accounts for sales on the days in between',()=>{
+  const today='2026-10-24';
+  // 10 sold per day, 50 in stock with a long shelf life: the stock is gone after ~5 days.
+  const records=Array.from({length:35},(_,i)=>row(addDays(today,i-34),10,{stock:50,shelf_life_days:30}));
+  const tomorrowPlan=buildPlan(records,{date:addDays(today,1),today});
+  assert.equal(tomorrowPlan.items[0].usableStock,50);assert.equal(tomorrowPlan.items[0].order,0);
+  const later=buildPlan(records,{date:addDays(today,6),today});
+  assert.ok(later.items[0].usableStock<=1,'opening stock must not still be on the shelf after 5 days of sales');
+  assert.equal(later.items[0].order,later.items[0].forecast+later.items[0].buffer-later.items[0].usableStock);
+  assert.equal(later.week.length,7);assert.equal(later.week[0].date,addDays(today,6));
+});
+
+test('shelf life is counted from the row date, so an old CSV cannot revive expired stock',()=>{
+  const today='2026-10-24', last=addDays(today,-10);
+  const records=Array.from({length:35},(_,i)=>row(addDays(last,i-34),10,{stock:25,shelf_life_days:7}));
+  const p=buildPlan(records,{date:addDays(today,1),today});
+  assert.equal(p.items[0].usableStock,0);assert.equal(p.items[0].stockExpires,addDays(last,7));
+  assert.equal(p.tips[0].expired,true);assert.equal(p.tips[0].days,0);assert.equal(p.tips[0].excess,25);
+  // Same CSV recorded yesterday with 3 days left: 2 days remain as of today.
+  const fresh=buildPlan(records.map(r=>({...r,date:addDays(r.date,9),shelf_life_days:3})),{date:addDays(today,1),today});
+  assert.equal(fresh.items[0].usableStock,25);assert.equal(fresh.tips[0].days,2);
+});
+
+test('Excel-style CSV: DD.MM.YYYY dates, spaces in numbers, Windows-1251',async()=>{
+  const d=addDays(today,-1), [y,m,dd]=d.split('-');
+  const parsed=parseCSV(`date;product;qty;price;stock;shelf_life_days\n${dd}.${m}.${y};Хлеб;10;1 300,5;3;1\n${today} 0:00;Хлеб;1 200;650;3;1\n`);
+  assert.equal(parsed[0].date,d);assert.equal(parsed[0].price,1300.5);assert.equal(parsed[1].qty,1200);
+  assert.throws(()=>parseCSV(`date,product,qty,price,stock,shelf_life_days\n03/04/2026,Хлеб,1,2,3,1`),/DD\.MM\.YYYY/);
+  const cp1251=Buffer.from([...Buffer.from(`date;product;qty;price;stock;shelf_life_days\n${today};`),0xd5,0xeb,0xe5,0xe1,...Buffer.from(';10;650;3;1\n')]);
+  assert.equal(parseCSV(decodeCSV(cp1251))[0].product,'Хлеб');
+  assert.equal(decodeCSV(Buffer.from('﻿date,Хлеб','utf8')),'date,Хлеб');
+});
+
+test('HTTP: cookieless traffic cannot lock out visitors; raw-byte upload works',async()=>{
+  const app=createApp({weatherProvider:async()=>({})});const server=app.listen(0,'127.0.0.1');
+  await new Promise(resolve=>server.once('listening',resolve));
+  const base=`http://127.0.0.1:${server.address().port}`;
+  try {
+    const first=await fetch(base+'/api/config');const cookie=first.headers.get('set-cookie').split(';')[0];
+    const csv=toCSV(Array.from({length:35},(_,i)=>row(addDays(today,i-34),10,{product:'Тестовый хлеб'})));
+    const up=await fetch(base+'/api/upload',{method:'POST',headers:{cookie,'Content-Type':'application/octet-stream'},body:Buffer.from(csv)});
+    assert.equal(up.status,200);
+    const statuses=await Promise.all(Array.from({length:150},()=>fetch(base+'/api/config').then(r=>r.status)));
+    assert.ok(statuses.every(s=>s===200),'new visitors must not get 503');
+    const own=await(await fetch(base+'/api/config',{headers:{cookie}})).json();assert.equal(own.dataset.products,1,'uploaded data survives');
+  } finally { await new Promise(resolve=>server.close(resolve)); }
+});
+

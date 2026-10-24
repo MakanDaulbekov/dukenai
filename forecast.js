@@ -6,6 +6,11 @@ export const dateISO = date => date.toISOString().slice(0, 10);
 export const addDays = (date, n) => dateISO(new Date(new Date(date + 'T12:00:00Z').getTime() + n * DAY));
 export const todayKZ = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Almaty', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
 export function validDate(value) { return /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(Date.parse(value)) && dateISO(new Date(value)) === value; }
+export const daysBetween = (from, to) => Math.round((Date.parse(to + 'T12:00:00Z') - Date.parse(from + 'T12:00:00Z')) / DAY);
+// shelf_life_days is recorded together with stock on the row's date: the leftover can still be sold
+// for that many following days. 0 = already expired. The last sellable day is therefore fixed by the
+// row date, so an older CSV cannot make expired stock look fresh.
+export const lastSellable = row => addDays(row.date, row.shelf_life_days);
 const weekday = date => new Date(date + 'T12:00:00Z').getUTCDay();
 const average = rows => rows.reduce((s, r) => s + r.qty, 0) / rows.length;
 export function category(product) {
@@ -14,6 +19,18 @@ export function category(product) {
   if (/мука|мяс|говяд|баран|торт|печень|булоч|круассан|синнабон|баурсак|шоколад|слад|\b(?:flour|meat|steak|cake|cookies?|croissants?|baursaks?|bun|cinnamon roll)\b/i.test(product)) return 'celebration';
   if (/хлеб|багет|батон|\b(?:bread|baguette)\b/i.test(product)) return 'bread';
   return 'other';
+}
+// Excel with a Russian/Kazakh locale saves CSV in Windows-1251, dates as DD.MM.YYYY and numbers as "1 300,5".
+export function decodeCSV(buffer) {
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(buffer); }
+  catch { return new TextDecoder('windows-1251').decode(buffer); }
+}
+function normalizeDate(value) {
+  const iso = value.match(/^(\d{4}-\d{2}-\d{2})(?:[T ]\d{1,2}:\d{2}(?::\d{2})?)?$/);
+  if (iso) return iso[1];
+  // Only dots: "03/04/2026" is ambiguous (US Excel writes M/D/Y), so slashes are rejected instead of guessed.
+  const dmy = value.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})(?: \d{1,2}:\d{2}(?::\d{2})?)?$/);
+  return dmy ? `${dmy[3]}-${dmy[2].padStart(2, '0')}-${dmy[1].padStart(2, '0')}` : value;
 }
 // RFC4180-style CSV parsing: quoted commas, escaped quotes, BOM, CRLF and semicolon.
 export function parseCSV(text) {
@@ -47,11 +64,12 @@ export function parseCSV(text) {
     const line = i + 2;
     if (cells.length !== header.length) throw new Error(`Row ${line}: the number of cells does not match the header.`);
     const raw = Object.fromEntries(header.map((h, k) => [h, cells[k]]));
-    if (!validDate(raw.date) || raw.date > todayKZ()) throw new Error(`Row ${line}: date must be a valid YYYY-MM-DD date, no later than today.`);
+    raw.date = normalizeDate(raw.date);
+    if (!validDate(raw.date) || raw.date > todayKZ()) throw new Error(`Row ${line}: date must be a valid date (YYYY-MM-DD or DD.MM.YYYY), no later than today.`);
     if (!raw.product || raw.product.length > 100 || /[\x00-\x1F]/.test(raw.product)) throw new Error(`Row ${line}: check the product name (1–100 characters).`);
     const r = { date: raw.date, product: raw.product };
     for (const k of ['qty', 'price', 'stock', 'shelf_life_days']) {
-      const numeric = raw[k].replace(',', '.');
+      const numeric = raw[k].replace(/[\s']/g, '').replace(',', '.');
       if (!/^\d+(\.\d+)?$/.test(numeric)) throw new Error(`Row ${line}: ${k} must be a non-negative number.`);
       r[k] = Number(numeric);
       if (!Number.isFinite(r[k]) || r[k] > 1000000 || (k !== 'price' && !Number.isInteger(r[k]))) throw new Error(`Row ${line}: ${k} must be a whole number up to 1,000,000 (price may include decimals).`);
@@ -95,44 +113,47 @@ export function forecastProduct(rows, date, district, weather) {
   }
   const forecast = Math.round(base * factor), bufferRate = latest.shelf_life_days <= 2 ? 0.05 : 0.1;
   const buffer = Math.ceil(forecast * bufferRate);
-  const expired = latest.shelf_life_days === 0;
-  const stock = expired ? 0 : latest.stock;
-  return { product: latest.product, forecast, base: Math.round(base * 10) / 10, buffer, bufferRate, stock: latest.stock, usableStock: stock, order: Math.max(0, forecast + buffer - stock), price: latest.price, shelfLife: latest.shelf_life_days, stockDate: latest.date, samples: sample.length, limited: comparable.length < 4, reasons };
+  const expires = lastSellable(latest);
+  const stock = expires >= date ? latest.stock : 0;
+  return { product: latest.product, forecast, base: Math.round(base * 10) / 10, buffer, bufferRate, stock: latest.stock, usableStock: stock, order: Math.max(0, forecast + buffer - stock), price: latest.price, shelfLife: latest.shelf_life_days, stockDate: latest.date, stockExpires: expires, samples: sample.length, limited: comparable.length < 4, reasons };
 }
 export function buildPlan(records, { date, district = 'residential', city = 'almaty', weather = {}, source = 'upload', today = todayKZ() }) {
   const groups = new Map();
   for (const row of records) { if (!groups.has(row.product)) groups.set(row.product, []); groups.get(row.product).push(row); }
-  const items = [...groups.values()].map(rows => forecastProduct(rows, date, district, weather));
-  const week = Array.from({ length: 7 }, (_, i) => {
-    const day = addDays(date, i);
-    return { date: day, items: [...groups.values()].map(rows => forecastProduct(rows, day, district, weather)) };
-  });
-  // FIFO stock simulation. Initial stock is counted once; expired batches cannot offset orders.
-  for (const item of items) {
-    let batches = item.usableStock ? [{ qty: item.usableStock, expires: addDays(today, item.shelfLife) }] : [];
-    for (const day of week) {
-      const row = day.items.find(r => r.product === item.product);
+  const products = [...groups.values()];
+  // The simulation always starts tomorrow. For a later forecast date, the days in between are simulated
+  // too (sales follow the forecast, baking follows the plan), so stock is not counted as if nothing sold.
+  const start = date < addDays(today, 1) ? date : addDays(today, 1);
+  const days = Array.from({ length: daysBetween(start, date) + 7 }, (_, i) => addDays(start, i));
+  const simulated = days.map(day => ({ date: day, items: products.map(rows => forecastProduct(rows, day, district, weather)) }));
+  // FIFO stock simulation. Opening stock is counted once and expires on its own date; expired batches cannot offset orders.
+  products.forEach((rows, p) => {
+    const latest = rows.at(-1);
+    let batches = latest.stock ? [{ qty: latest.stock, expires: lastSellable(latest) }] : [];
+    for (const day of simulated) {
+      const row = day.items[p];
       batches = batches.filter(b => b.expires >= day.date && b.qty > 0);
       row.usableStock = batches.reduce((s, b) => s + b.qty, 0);
       row.order = Math.max(0, row.forecast + row.buffer - row.usableStock);
       // New production uses the same conservative shelf-life assumption as the last batch.
-      if (row.order) batches.push({ qty: row.order, expires: addDays(day.date, Math.max(1, item.shelfLife) - 1) });
+      if (row.order) batches.push({ qty: row.order, expires: addDays(day.date, Math.max(1, latest.shelf_life_days) - 1) });
       batches.sort((a, b) => a.expires.localeCompare(b.expires));
       let demand = row.forecast;
       for (const b of batches) { const take = Math.min(b.qty, demand); b.qty -= take; demand -= take; }
     }
-    const first = week[0].items.find(r => r.product === item.product);
-    item.usableStock = first.usableStock; item.order = first.order;
-  }
+  });
+  const week = simulated.filter(d => d.date >= date);
+  const items = week[0].items.map(r => ({ ...r }));
   const tips = [];
-  for (const item of items) {
-    if (item.stock === 0 || item.shelfLife > 14) continue;
-    const rows = groups.get(item.product);
+  products.forEach(rows => {
+    const latest = rows.at(-1);
+    const daysLeft = Math.max(0, daysBetween(today, lastSellable(latest)));
+    if (latest.stock === 0 || daysLeft > 14) return;
     let expected = 0;
-    for (let i = 1; i <= item.shelfLife; i++) expected += forecastProduct(rows, addDays(today, i), district, weather).forecast;
-    const excess = Math.max(0, item.stock - expected);
-    if (excess) tips.push({ product: item.product, stock: item.stock, days: item.shelfLife, expected, excess, valueAtRisk: excess * item.price, discount: item.shelfLife === 0 ? 0 : (item.shelfLife === 1 ? 30 : 20), expired: item.shelfLife === 0 });
-  }
+    for (let i = 1; i <= daysLeft; i++) expected += forecastProduct(rows, addDays(today, i), district, weather).forecast;
+    const excess = Math.max(0, latest.stock - expected), expired = daysLeft === 0;
+    if (excess) tips.push({ product: latest.product, stock: latest.stock, days: daysLeft, expected, excess, valueAtRisk: excess * latest.price, discount: expired ? 0 : (daysLeft === 1 ? 30 : 20), expired });
+  });
   tips.sort((a, b) => b.valueAtRisk - a.valueAtRisk);
   const history = Array.from({ length: 30 }, (_, i) => {
     const d = addDays(today, i - 29), rows = records.filter(r => r.date === d);
@@ -143,7 +164,7 @@ export function buildPlan(records, { date, district = 'residential', city = 'alm
   if (items.some(r => r.limited)) warnings.push('Some products have fewer than 4 matching weekdays. Their forecasts are preliminary.');
   if (items.some(r => r.stockDate < today)) warnings.push('Stock is taken from the latest entry for each product. Check stock and remaining shelf life today.');
   if (!holiday(date).lunarCalendarKnown) warnings.push('The Kurban Ait date for the selected year has not been added to the demo calendar.');
-  if (date !== addDays(today, 1)) warnings.push('Stock is assumed unchanged until the selected date; expired batches are excluded. Check stock before baking.');
+  if (date > addDays(today, 1)) warnings.push('For days before the selected date, the plan assumes sales match the forecast and you bake or order as planned. Check stock before baking.');
   if (!weather[date]) warnings.push('Weather is unavailable for the selected date. No weather adjustment is applied.');
   const result = { date, district, city, holiday: holiday(date).name, items, week: week.map(d => ({ ...d, forecast: sum(d.items, 'forecast'), order: sum(d.items, 'order') })), history, tips, warnings, dataset: metadata(records, source), weather: weather[date] || null, totals: { forecast: sum(items, 'forecast'), order: sum(items, 'order'), stock: sum(items, 'stock'), buffer: sum(items, 'buffer'), risk: sum(tips, 'valueAtRisk'), riskQty: sum(tips, 'excess'), baseline: Math.round(sum(items, 'base')) } };
   result.summary = summarize(result);

@@ -142,9 +142,8 @@ async function upload(file) {
   if (!file.name.toLowerCase().endsWith('.csv')) {error('Please choose a .csv file.');$('#data-dialog').close();return;}
   setBusy(true);error('');
   try {
-    const csv = await file.text();
-    if (csv.includes('\uFFFD')) throw new Error('The file encoding could not be read. Save the CSV as UTF-8.');
-    const response = await api('/api/upload', {method:'POST',headers:{'Content-Type':'text/csv; charset=utf-8'},body:csv});
+    // Raw bytes: the server accepts UTF-8 and Windows-1251 (Excel's default CSV encoding on Russian Windows).
+    const response = await api('/api/upload', {method:'POST',headers:{'Content-Type':'application/octet-stream'},body:file});
     plan = null; $('#results').hidden = true; renderDataset(response.dataset);
     $('#data-dialog').close();setBusy(false);const ok = await calculate();notify(ok ? 'CSV uploaded. Your plan now uses your sales data.' : 'CSV uploaded. Please generate the plan again.');
   } catch(e){error(e.message);$('#data-dialog').close();}finally{setBusy(false);$('#csv-file').value='';}
