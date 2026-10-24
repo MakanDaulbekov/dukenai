@@ -1,0 +1,10 @@
+{
+  "name": "dukenai",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Explainable demand forecasting for bakeries and stores",
+  "engines": { "node": ">=22" },
+  "scripts": { "start": "node server.js", "dev": "node --watch server.js", "test": "node --test", "demo": "node generate-demo.js" },
+  "dependencies": { "express": "^5.1.0" }
+}
